@@ -95,7 +95,13 @@ async def proxy(tenant_slug: str, path: str, request: Request, user: User = Depe
             url=target_url,
             params=request.query_params,
             content=body,
-            headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "cookie", "content-length")},
+            # Excludes the browser's own Accept-Encoding (e.g. "br") from the upstream
+            # request -- httpx has no Brotli decoder installed, so if the upstream (fronted
+            # by Cloudflare on Render) compressed its response with Brotli in response to
+            # that header, httpx receives undecoded compressed bytes it can't unpack, and
+            # they'd be forwarded to the browser as garbage. Letting httpx omit/set its own
+            # Accept-Encoding means it only ever receives encodings it can actually decode.
+            headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "cookie", "content-length", "accept-encoding")},
             timeout=120,
         )
 
