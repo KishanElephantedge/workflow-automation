@@ -14,7 +14,10 @@ from app.config import settings
 
 Base = declarative_base()
 
-engine = create_engine(settings.database_url)
+# pool_pre_ping guards against Neon's pooled ("-pooler") endpoint handing back a stale
+# connection after the app has been idle -- this is very likely what caused the earlier
+# intermittent 500 on /auth/login (first request after the free-tier instance woke up).
+engine = create_engine(settings.database_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
