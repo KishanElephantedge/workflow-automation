@@ -45,8 +45,8 @@ def login(email: str, password: str, response: Response, db: Session = Depends(g
         key=COOKIE_NAME,
         value=token,
         httponly=True,   # JavaScript cannot read this -- not localStorage, not accessible to XSS
-        samesite="lax",
-        secure=False,     # set True once served over HTTPS in production
+        samesite=settings.cookie_samesite,
+        secure=settings.cookie_secure,
         max_age=settings.jwt_expire_minutes * 60,
     )
     return {"id": user.id, "email": user.email, "name": user.name}
@@ -54,7 +54,7 @@ def login(email: str, password: str, response: Response, db: Session = Depends(g
 
 @app.post("/auth/logout")
 def logout(response: Response):
-    response.delete_cookie(COOKIE_NAME)
+    response.delete_cookie(COOKIE_NAME, samesite=settings.cookie_samesite, secure=settings.cookie_secure)
     return {"logged_out": True}
 
 
