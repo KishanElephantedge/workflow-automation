@@ -11,7 +11,10 @@ app = FastAPI(title="Platform Gateway")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_origin],
+    # FRONTEND_ORIGIN supports a comma-separated list, so the old Vercel URL and a newly
+    # connected custom domain can both work during a transition, not just whichever one
+    # variable happens to be set.
+    allow_origins=[o.strip() for o in settings.frontend_origin.split(",") if o.strip()],
     allow_credentials=True,  # required for the browser to send/receive the httpOnly session cookie
     allow_methods=["*"],
     allow_headers=["*"],
