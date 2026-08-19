@@ -38,8 +38,24 @@ def health():
 # authenticated user may access any tenant; access control here is "logged in or not,"
 # not "logged in as tenant X."
 
+
+def _cookie_kwargs(request: Request) -> dict:
+    """Real bug fix (2026-08-19): COOKIE_SAMESITE/COOKIE_SECURE env vars were added in
+    da42cb0 to fix cross-site cookies (frontend on vercel.app, gateway on onrender.com --
+    SameSite=Lax cookies are silently dropped from cross-site XHR/fetch), but whether those
+    env vars were actually *set* in Render's dashboard could never be confirmed from the
+    repo -- and a mobile-login-stuck-on-login-screen report meant they likely weren't.
+    Deriving Secure/SameSite from the request's own scheme instead removes that manual step
+    entirely: Render always terminates TLS and forwards X-Forwarded-Proto: https, so a real
+    HTTPS deployment gets SameSite=None/Secure=True automatically, while local plain-HTTP
+    dev (where Secure would silently make the browser refuse to store the cookie at all)
+    keeps SameSite=Lax/Secure=False."""
+    is_https = request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
+    return {"samesite": "none", "secure": True} if is_https else {"samesite": "lax", "secure": False}
+
+
 @app.post("/auth/login")
-def login(email: str, password: str, response: Response, db: Session = Depends(get_db)):
+def login(email: str, password: str, request: Request, response: Response, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == email).first()
     if not user or not verify_password(password, user.password_hash):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
@@ -48,16 +64,16 @@ def login(email: str, password: str, response: Response, db: Session = Depends(g
         key=COOKIE_NAME,
         value=token,
         httponly=True,   # JavaScript cannot read this -- not localStorage, not accessible to XSS
-        samesite=settings.cookie_samesite,
-        secure=settings.cookie_secure,
         max_age=settings.jwt_expire_minutes * 60,
+        **_cookie_kwargs(request),
     )
     return {"id": user.id, "email": user.email, "name": user.name}
 
 
 @app.post("/auth/logout")
-def logout(response: Response):
-    response.delete_cookie(COOKIE_NAME, samesite=settings.cookie_samesite, secure=settings.cookie_secure)
+def logout(request: Request, response: Response):
+    kwargs = _cookie_kwargs(request)
+    response.delete_cookie(COOKIE_NAME, samesite=kwargs["samesite"], secure=kwargs["secure"])
     return {"logged_out": True}
 
 
