@@ -7,7 +7,7 @@ codebase touches it). Same intentional-duplication pattern as elephantedge-abm/a
 
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Integer, String, create_engine
+from sqlalchemy import Column, DateTime, Integer, String, create_engine, event
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import settings
@@ -19,6 +19,20 @@ Base = declarative_base()
 # intermittent 500 on /auth/login (first request after the free-tier instance woke up).
 engine = create_engine(settings.database_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+# Found live (2026-08-21, Neon project migration) -- a pooled ("-pooler") connection can come
+# back with search_path effectively empty, making unqualified table references (tenants,
+# users) fail with "relation does not exist" even though they exist in the public schema.
+# Neon's pooler rejects search_path as a startup parameter outright, and an ALTER DATABASE
+# -level default does not reliably apply to pooled connections either -- fixed via a normal
+# post-connect query instead, same pattern applied in elephantedge-abm/app/db/session.py and
+# synefi/app/db/session.py for the same shared database.
+@event.listens_for(engine, "connect")
+def _set_search_path(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("SET search_path TO public")
+    cursor.close()
 
 
 class Tenant(Base):
