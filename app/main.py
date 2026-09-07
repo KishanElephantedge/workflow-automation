@@ -133,6 +133,28 @@ def _slugify(name: str) -> str:
     return f"partner:{base}"
 
 
+def _shared_product_backend_url(db: Session) -> str | None:
+    """The backend_url every partner tenant should proxy through.
+
+    Real gap found while wiring the "accounts" page end to end, not while reading code: every
+    partner tenant created by the discovery pipeline (get_or_create_partner_tenant in
+    elephantedge-abm) has backend_url=NULL -- correct at the time, since those tenants were
+    only ever a DB-level data boundary, queried directly, never reached over HTTP. But
+    proxy() 404s on a null backend_url regardless of role, so a partner's OWN login would hit
+    that wall trying to load their own accounts page, and so would an internal admin trying to
+    fetch anything for them through this gateway.
+
+    Partner tenants and Elephant Edge's own tenant are the SAME deployed backend and the SAME
+    database -- tenant separation happens via the X-Tenant-Id header proxy() already sets, not
+    via a different server. So the right backend_url for a partner tenant is simply whichever
+    one Elephant Edge's own tenant uses today, looked up by slug rather than a hardcoded
+    constant (this file has no ELEPHANT_EDGE_TENANT_ID of its own, and slug is the stable,
+    self-describing identifier already used everywhere else in this file).
+    """
+    elephant_edge = db.query(Tenant).filter(Tenant.slug == "elephant-edge").first()
+    return elephant_edge.backend_url if elephant_edge else None
+
+
 class TenantCreate(BaseModel):
     name: str
 
@@ -165,12 +187,13 @@ def create_tenant(payload: TenantCreate, user: User = Depends(require_internal),
     slug = _slugify(payload.name)
     if db.query(Tenant).filter(Tenant.slug == slug).first():
         raise HTTPException(status_code=409, detail=f"A tenant with slug '{slug}' already exists -- search for it instead of creating a duplicate")
-    # backend_url stays NULL, matching partner_pipeline.get_or_create_partner_tenant's own
-    # existing convention: these tenants are a data boundary inside the shared product
-    # database, not a separately deployed service. enabled_features starts at stage 1 only
-    # ("accounts") per the explicit stage-by-stage rollout -- never "everything", since a
-    # brand new partner tenant has nothing built for it yet beyond that.
-    tenant = Tenant(name=payload.name.strip(), slug=slug, backend_url=None, enabled_features=["accounts"])
+    # backend_url is Elephant Edge's own -- see _shared_product_backend_url's docstring for
+    # why that's correct rather than NULL: partner tenants share the same deployed backend,
+    # separated by the X-Tenant-Id header, not by a different server. enabled_features starts
+    # at stage 1 only ("accounts") per the explicit stage-by-stage rollout -- never
+    # "everything", since a brand new partner tenant has nothing built for it yet beyond that.
+    tenant = Tenant(name=payload.name.strip(), slug=slug,
+                     backend_url=_shared_product_backend_url(db), enabled_features=["accounts"])
     db.add(tenant)
     db.commit()
     db.refresh(tenant)
@@ -223,6 +246,16 @@ def create_partner_user(payload: UserCreate, user: User = Depends(require_intern
     tenant = db.get(Tenant, payload.tenant_id)
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
+    # Backfill for tenants attached via the "existing tenant" search step (e.g. Sandy Yu's,
+    # created by the discovery pipeline before this feature existed): those predate
+    # enabled_features/backend_url entirely, and without this a real partner would log in to
+    # a tenant with nothing configured to show them and no route to reach it through. Never
+    # overwrites a value that's already set -- only fills what create_tenant would have set
+    # for a brand new tenant.
+    if tenant.backend_url is None:
+        tenant.backend_url = _shared_product_backend_url(db)
+    if tenant.enabled_features is None:
+        tenant.enabled_features = ["accounts"]
     new_user = User(
         email=payload.email.strip().lower(),
         password_hash=hash_password(payload.password),
