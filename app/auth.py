@@ -44,3 +44,14 @@ def get_current_user(
     if not user:
         raise HTTPException(status_code=401, detail="User no longer exists")
     return user
+
+
+def require_internal(user: User = Depends(get_current_user)) -> User:
+    """Gate for the admin surface (creating users/tenants). A partner login must never be
+    able to create another login or see the raw tenant table -- that's the same trust
+    boundary a role="partner" restriction exists to protect in the first place, so the admin
+    routes get their own explicit dependency rather than relying on callers to remember a
+    manual `if user.role != "internal"` check."""
+    if user.role != "internal":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
