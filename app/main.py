@@ -98,6 +98,23 @@ def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     return _user_payload(user, db)
 
 
+class ProfileUpdate(BaseModel):
+    name: str | None = None
+
+
+@app.patch("/auth/me")
+def update_my_profile(payload: ProfileUpdate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Self-service, not an admin route -- any authenticated user (partner or internal)
+    editing their OWN row, gated by get_current_user alone. Deliberately does not accept
+    email or password here: changing either needs its own verification step (a duplicate-email
+    check, a current-password confirmation) that a plain PATCH would skip -- name is the one
+    field with no such risk."""
+    if payload.name is not None:
+        user.name = payload.name.strip() or None
+    db.commit()
+    return _user_payload(user, db)
+
+
 # ---- Tenant directory ----
 # Authenticated only. Never returns backend_url to the client -- the client only ever needs
 # to know a tenant's slug; the gateway resolves slug -> backend_url internally, server-side,
