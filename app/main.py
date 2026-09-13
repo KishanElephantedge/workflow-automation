@@ -315,6 +315,13 @@ ACTIVE_WINDOW_MINUTES = 5
 _MAX_TEXT = 500
 _ALLOWED_EVENT_TYPES = {"pageview", "click", "heartbeat"}
 
+# Per-session ceiling on recorded pageviews/clicks per minute. No person navigates faster than
+# about one page a second, so this never touches real use -- it exists because a redirect loop in
+# the partner app once produced 1,684 pageview writes from a single visit (2026-09-13). The client
+# now debounces, but a server must not depend on every client behaving; past this limit the
+# session's liveness is still refreshed and only the redundant event rows are dropped.
+MAX_EVENTS_PER_SESSION_PER_MINUTE = 60
+
 
 def _truncate(value: str | None, limit: int = _MAX_TEXT) -> str | None:
     if value is None:
@@ -438,6 +445,19 @@ def record_usage_event(
         session.last_path = path
 
     if event_type in ("pageview", "click"):
+        recent = (
+            db.query(func.count(UsageEvent.id))
+            .filter(
+                UsageEvent.session_id == session.session_id,
+                UsageEvent.created_at >= now - timedelta(minutes=1),
+            )
+            .scalar()
+            or 0
+        )
+        if recent >= MAX_EVENTS_PER_SESSION_PER_MINUTE:
+            db.commit()
+            return {"ok": True, "throttled": True}
+
         if event_type == "pageview":
             # Incremented as a SQL expression, NOT `session.pageview_count + 1` in Python.
             # Found live (2026-09-13) with 12 concurrent pageviews on one session: a Python
@@ -481,8 +501,9 @@ def usage_summary(
     def _user_info(user_id: int) -> dict:
         u = user_rows.get(user_id)
         if u is None:
-            return {"email": None, "name": None, "role": None}
-        return {"email": u.email, "name": u.name, "role": u.role}
+            return {"email": None, "name": None, "role": None, "home_workspace": None}
+        # A partner belongs to one workspace; an internal user belongs to none in particular.
+        return {"email": u.email, "name": u.name, "role": u.role, "home_workspace": tenant_names.get(u.tenant_id)}
 
     live_sessions = (
         db.query(UsageSession)
@@ -543,6 +564,48 @@ def usage_summary(
         or 0
     )
 
+    # Every workspace, INCLUDING ones with no activity at all. "Which partners are using this" is
+    # only half the question -- a partner who has a login and has never opened their dashboard is
+    # exactly what an admin needs to see, and a list built only from recorded events would hide
+    # them. Internal users are excluded from `logins` because they can open any workspace; a
+    # workspace's own logins are the people it was actually set up for.
+    per_tenant_map = {tenant_id: (views, users) for tenant_id, views, users in per_tenant}
+    # From events, not sessions: a session keeps only the workspace it was LAST on, so moving
+    # from Elephant Edge into a partner's view erased Elephant Edge's last-seen (found in test).
+    # Events carry their own workspace permanently. All-time, not windowed -- "last seen three
+    # weeks ago" is the useful answer for a quiet partner, not "never".
+    last_seen_by_tenant = dict(
+        db.query(UsageEvent.tenant_id, func.max(UsageEvent.created_at))
+        .filter(UsageEvent.tenant_id.isnot(None))
+        .group_by(UsageEvent.tenant_id)
+        .all()
+    )
+    active_now_by_tenant: dict[int, set] = {}
+    for s in live_sessions:
+        if s.tenant_id is not None:
+            active_now_by_tenant.setdefault(s.tenant_id, set()).add(s.user_id)
+    logins_by_tenant: dict[int, int] = {}
+    for u in user_rows.values():
+        if u.role == "partner" and u.tenant_id is not None:
+            logins_by_tenant[u.tenant_id] = logins_by_tenant.get(u.tenant_id, 0) + 1
+
+    workspaces = []
+    for t in db.query(Tenant).all():
+        views, users = per_tenant_map.get(t.id, (0, 0))
+        workspaces.append({
+            "tenant": t.name,
+            "slug": t.slug,
+            # A slug prefix alone missed real partners: a workspace is partner-facing if it was
+            # created as one, has partner features switched on, or has any partner login at all.
+            "is_partner": t.slug.startswith("partner:") or t.enabled_features is not None or logins_by_tenant.get(t.id, 0) > 0,
+            "logins": logins_by_tenant.get(t.id, 0),
+            "active_now": len(active_now_by_tenant.get(t.id, ())),
+            "pageviews": views,
+            "users": users,
+            "last_seen_at": last_seen_by_tenant.get(t.id),
+        })
+    workspaces.sort(key=lambda w: (-w["active_now"], -w["pageviews"], w["last_seen_at"] is None, w["tenant"].lower()))
+
     return {
         "window_days": window_days,
         "generated_at": now,
@@ -550,6 +613,9 @@ def usage_summary(
             "window_minutes": ACTIVE_WINDOW_MINUTES,
             "active_users": len({s.user_id for s in live_sessions}),
             "active_sessions": len(live_sessions),
+            # One row per PERSON, from their most recent session. live_sessions is already
+            # ordered newest-first, so the first session seen for a user is their current one;
+            # two open tabs are one person on the platform, not two.
             "now": [
                 {
                     **_user_info(s.user_id),
@@ -558,8 +624,9 @@ def usage_summary(
                     "country": s.country,
                     "last_seen_at": s.last_seen_at,
                     "started_at": s.started_at,
+                    "open_sessions": sum(1 for x in live_sessions if x.user_id == s.user_id),
                 }
-                for s in live_sessions
+                for s in {sess.user_id: sess for sess in reversed(live_sessions)}.values()
             ],
         },
         "totals": {
@@ -580,6 +647,7 @@ def usage_summary(
             }
             for user_id, views, sessions, last_seen in per_user
         ],
+        "workspaces": workspaces,
         "by_tenant": [
             {"tenant": tenant_names.get(tenant_id) or "(none)", "pageviews": views, "users": users}
             for tenant_id, views, users in per_tenant
