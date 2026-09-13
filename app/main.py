@@ -1,8 +1,11 @@
 import re
+import secrets
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import func
@@ -11,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import COOKIE_NAME, create_session_token, get_current_user, hash_password, require_internal, verify_password
 from app.config import settings
-from app.db import Base, Tenant, UsageEvent, UsageSession, User, engine, ensure_columns, get_db
+from app.db import Base, LinkClick, Tenant, TrackedLink, UsageEvent, UsageSession, User, engine, ensure_columns, get_db
 
 app = FastAPI(title="Platform Gateway")
 
@@ -586,6 +589,182 @@ def usage_summary(
             for country, count in sorted(by_country.items(), key=lambda kv: -kv[1])
         ],
     }
+
+
+# ---- Link tracking ----
+# Self-hosted equivalent of Dub/Shlink/YOURLS. Built here rather than adopted because the only
+# piece we actually need is a redirect that records a click, and the gateway already has the
+# public HTTPS surface, the database and the auth model to do it -- and because owning it means
+# a click can be attributed to a real recipient, which a generic shortener has no concept of.
+#
+# Reachable in production as https://app.fractionalpartner.us/l/<slug> via the Vercel rewrite
+# that already fronts this gateway.
+
+# Ambiguous characters (0/O, 1/l/I) are excluded: these get read aloud, retyped off a screen,
+# and pasted out of messages by hand.
+_SLUG_ALPHABET = "abcdefghijkmnopqrstuvwxyzACDEFGHJKLMNPQRSTUVWXYZ23456789"
+_SLUG_LENGTH = 7
+
+# Substrings that identify automated fetchers rather than a person clicking. LinkedIn, Slack,
+# WhatsApp and mail-security scanners all fetch a URL the instant it is sent; counting those as
+# human clicks would inflate every number this feature exists to report.
+_BOT_UA_MARKERS = (
+    "bot", "crawler", "spider", "preview", "linkedinbot", "slackbot", "whatsapp",
+    "telegrambot", "discordbot", "facebookexternalhit", "twitterbot", "skypeuripreview",
+    "google-safety", "proofpoint", "barracuda", "mimecast", "symantec", "curl/", "wget/",
+    "python-requests", "headlesschrome", "monitoring",
+)
+
+
+def _looks_like_bot(user_agent: str | None) -> bool:
+    if not user_agent:
+        # A real browser always sends a User-Agent. Its absence is far more likely to be a
+        # script than a person, so this is treated as automated rather than counted as a click.
+        return True
+    ua = user_agent.lower()
+    return any(marker in ua for marker in _BOT_UA_MARKERS)
+
+
+def _generate_slug(db: Session) -> str:
+    for _ in range(10):
+        slug = "".join(secrets.choice(_SLUG_ALPHABET) for _ in range(_SLUG_LENGTH))
+        if db.query(TrackedLink).filter(TrackedLink.slug == slug).first() is None:
+            return slug
+    raise HTTPException(status_code=500, detail="Could not allocate a unique link slug")
+
+
+class TrackedLinkIn(BaseModel):
+    destination_url: str
+    label: str | None = None
+    tenant_slug: str | None = None
+
+
+@app.get("/l/{slug}")
+def follow_link(slug: str, request: Request, r: str | None = None, db: Session = Depends(get_db)):
+    """Public and unauthenticated by necessity -- the people clicking these are prospects, not
+    users of this platform.
+
+    Recording a click must never prevent the redirect: if the click write fails for any reason,
+    the visitor is still sent to their destination and only the analytics row is lost. The
+    reverse (breaking a live link in someone's inbox to protect a metric) would be far worse."""
+    link = db.query(TrackedLink).filter(TrackedLink.slug == slug).first()
+    if link is None:
+        raise HTTPException(status_code=404, detail="Unknown link")
+
+    try:
+        db.add(
+            LinkClick(
+                link_id=link.id,
+                recipient=_truncate(r, 200),
+                is_bot=_looks_like_bot(request.headers.get("user-agent")),
+                ip=_client_ip(request),
+                country=_truncate(request.headers.get("cf-ipcountry"), 8),
+                user_agent=_truncate(request.headers.get("user-agent")),
+                referrer=_truncate(request.headers.get("referer")),
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    # 302, not 301: a permanent redirect is cached by the browser, so every click after the
+    # first would never reach this server again and would simply not be counted.
+    return RedirectResponse(url=link.destination_url, status_code=302)
+
+
+@app.post("/api/links")
+def create_link(payload: TrackedLinkIn, user: User = Depends(require_internal), db: Session = Depends(get_db)):
+    """Internal-only. This is what stops /l/ becoming an open redirect: only an authenticated
+    internal user can ever point one of our URLs at a destination, and the destination must be
+    a real http(s) URL rather than a javascript: or data: payload."""
+    destination = payload.destination_url.strip()
+    parsed = urlparse(destination)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="destination_url must be a full http(s) URL")
+
+    tenant_id = None
+    if payload.tenant_slug:
+        tenant = db.query(Tenant).filter(Tenant.slug == payload.tenant_slug.strip()).first()
+        if tenant is None:
+            raise HTTPException(status_code=404, detail=f"No tenant '{payload.tenant_slug}'")
+        tenant_id = tenant.id
+
+    link = TrackedLink(
+        slug=_generate_slug(db),
+        destination_url=destination,
+        label=_truncate(payload.label, 200),
+        tenant_id=tenant_id,
+        created_by_user_id=user.id,
+    )
+    db.add(link)
+    db.commit()
+    return _link_payload(link, db)
+
+
+def _link_payload(link: TrackedLink, db: Session, recent_limit: int = 0) -> dict:
+    clicks = db.query(LinkClick).filter(LinkClick.link_id == link.id)
+    total = clicks.count()
+    bots = clicks.filter(LinkClick.is_bot.is_(True)).count()
+    last_human = (
+        clicks.filter(LinkClick.is_bot.is_(False))
+        .order_by(LinkClick.created_at.desc())
+        .first()
+    )
+    payload = {
+        "id": link.id,
+        "slug": link.slug,
+        "destination_url": link.destination_url,
+        "label": link.label,
+        "tenant_id": link.tenant_id,
+        "created_at": link.created_at,
+        "archived_at": link.archived_at,
+        # The headline number is human clicks only; bot fetches are reported alongside it so
+        # the difference is visible rather than quietly folded in either direction.
+        "clicks": total - bots,
+        "bot_clicks": bots,
+        "last_clicked_at": last_human.created_at if last_human else None,
+    }
+    if recent_limit:
+        payload["recent"] = [
+            {
+                "recipient": c.recipient,
+                "is_bot": c.is_bot,
+                "country": c.country,
+                "referrer": c.referrer,
+                "created_at": c.created_at,
+            }
+            for c in clicks.order_by(LinkClick.created_at.desc()).limit(recent_limit).all()
+        ]
+    return payload
+
+
+@app.get("/api/links")
+def list_links(include_archived: bool = False, user: User = Depends(require_internal), db: Session = Depends(get_db)):
+    query = db.query(TrackedLink)
+    if not include_archived:
+        query = query.filter(TrackedLink.archived_at.is_(None))
+    links = query.order_by(TrackedLink.created_at.desc()).all()
+    return {"links": [_link_payload(link, db) for link in links]}
+
+
+@app.get("/api/links/{link_id}")
+def get_link(link_id: int, user: User = Depends(require_internal), db: Session = Depends(get_db)):
+    link = db.get(TrackedLink, link_id)
+    if link is None:
+        raise HTTPException(status_code=404, detail="Unknown link")
+    return _link_payload(link, db, recent_limit=100)
+
+
+@app.patch("/api/links/{link_id}/archive")
+def archive_link(link_id: int, user: User = Depends(require_internal), db: Session = Depends(get_db)):
+    """Archive, never delete -- see TrackedLink's own docstring. An archived link keeps
+    resolving for anyone who already has it; it just stops appearing in the default list."""
+    link = db.get(TrackedLink, link_id)
+    if link is None:
+        raise HTTPException(status_code=404, detail="Unknown link")
+    link.archived_at = datetime.utcnow() if link.archived_at is None else None
+    db.commit()
+    return _link_payload(link, db)
 
 
 # ---- Tenant-scoped reverse proxy ----

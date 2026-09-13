@@ -7,7 +7,7 @@ codebase touches it). Same intentional-duplication pattern as elephantedge-abm/a
 
 from datetime import datetime
 
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, create_engine, event, text
+from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Integer, String, create_engine, event, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import settings
@@ -131,6 +131,54 @@ class UsageEvent(Base):
     event_type = Column(String, nullable=False)  # "pageview" | "click"
     path = Column(String, nullable=True, index=True)
     label = Column(String, nullable=True)  # for click events: what was clicked
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class TrackedLink(Base):
+    """A short link we own, so we can see who actually clicks what we send out.
+
+    Outbound messages currently carry raw destination URLs (the Gumroad playbook links, for
+    example), which means a click is completely invisible to us -- there is no click data
+    anywhere in this platform today. Lives in the gateway because the gateway is the only
+    component with a public, always-on HTTP surface on the real domain; a per-tenant product
+    backend is not reachable at a short, stable URL a prospect can click."""
+
+    __tablename__ = "tracked_links"
+
+    id = Column(Integer, primary_key=True)
+    slug = Column(String, nullable=False, unique=True, index=True)
+    destination_url = Column(String, nullable=False)
+    label = Column(String, nullable=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=True, index=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    # Archiving rather than deleting: a link already sent to real people keeps resolving, and
+    # its click history stays intact. Deleting one would break a live link in someone's inbox.
+    archived_at = Column(DateTime, nullable=True)
+
+
+class LinkClick(Base):
+    """One row per resolved click.
+
+    is_bot matters more here than anywhere else in this codebase: LinkedIn, mail scanners and
+    chat-app link previewers all fetch a URL the moment it is sent, long before any human sees
+    it. Counting those as clicks would systematically overstate real interest, so they are
+    recorded (never silently dropped -- that would hide real traffic) and flagged, and the
+    headline numbers exclude them."""
+
+    __tablename__ = "link_clicks"
+
+    id = Column(Integer, primary_key=True)
+    link_id = Column(Integer, ForeignKey("tracked_links.id"), nullable=False, index=True)
+    # Optional ?r= value -- who this copy of the link was sent to, when a per-recipient link
+    # is used. Free-form on purpose: the recipient may be a Contact, a campaign name, or a
+    # channel, and the gateway has no model for any of them.
+    recipient = Column(String, nullable=True, index=True)
+    is_bot = Column(Boolean, nullable=False, default=False)
+    ip = Column(String, nullable=True)
+    country = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+    referrer = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
