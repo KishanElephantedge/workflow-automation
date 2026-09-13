@@ -77,6 +77,63 @@ class User(Base):
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=True)
 
 
+class UsageSession(Base):
+    """One row per browser session, UPDATED IN PLACE -- not one row per heartbeat.
+
+    The gateway is the only place that can answer "who is using this platform, from where"
+    honestly: it is the single chokepoint every authenticated request already passes through
+    (see proxy() in main.py), and it owns the User/Tenant tables. Neither per-tenant backend
+    can see across tenants, so this cannot live in elephantedge-abm.
+
+    WHY IN-PLACE UPDATES, NOT AN EVENT ROW PER PING: "who is on right now" needs a liveness
+    signal every ~60s per open tab. Stored as events that is ~480 rows/day per idle tab left
+    open, for a question that only ever reads the LATEST value. One row per session with a
+    moving last_seen_at answers it exactly as well at a fraction of the write volume, and
+    "active now" becomes a single indexed range scan on last_seen_at.
+
+    Identity is stamped server-side from the verified session cookie, never from the request
+    body -- same trust boundary as the x-tenant-id header proxy() sets."""
+
+    __tablename__ = "usage_sessions"
+
+    id = Column(Integer, primary_key=True)
+    session_id = Column(String, nullable=False, unique=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    # Which workspace the session was last looking at. Nullable because a session starts
+    # before any tenant is selected (login/tenant-picker screens have no tenant yet).
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=True, index=True)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, default=datetime.utcnow, index=True)
+    # Denormalized so "who is looking at what right now" is one indexed scan of this table,
+    # with no join back to usage_events to find each session's most recent pageview.
+    last_path = Column(String, nullable=True)
+    pageview_count = Column(Integer, nullable=False, default=0)
+    # "from where" -- country comes from Cloudflare's own CF-IPCountry header (Render sits
+    # behind Cloudflare). Left NULL when that header is absent rather than guessed from the
+    # IP, since no geo database is bundled here and an invented country is worse than none.
+    ip = Column(String, nullable=True)
+    country = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+    referrer = Column(String, nullable=True)
+
+
+class UsageEvent(Base):
+    """One row per real, discrete action (a page navigation or a tracked click) -- never a
+    liveness ping, which UsageSession.last_seen_at already covers. This is what answers
+    "which pages are actually used, by whom, how often"."""
+
+    __tablename__ = "usage_events"
+
+    id = Column(Integer, primary_key=True)
+    session_id = Column(String, nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=True, index=True)
+    event_type = Column(String, nullable=False)  # "pageview" | "click"
+    path = Column(String, nullable=True, index=True)
+    label = Column(String, nullable=True)  # for click events: what was clicked
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
 def get_db():
     db = SessionLocal()
     try:
