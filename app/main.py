@@ -240,6 +240,33 @@ def update_tenant_features(tenant_id: int, payload: TenantFeaturesUpdate, user: 
     return {"id": tenant.id, "enabledFeatures": tenant.enabled_features}
 
 
+class BackendUrlUpdate(BaseModel):
+    backend_url: str
+
+
+@app.post("/api/admin/backend-url")
+def set_backend_url_for_all_tenants(payload: BackendUrlUpdate, user: User = Depends(require_internal), db: Session = Depends(get_db)):
+    """The missing piece of the Render account rotation (see elephantedge-abm/deployment.md's
+    "Three-account rotation" section, added 2026-09-15). proxy() resolves EVERY tenant-scoped
+    request through Tenant.backend_url, but until now the only way to change it was a direct
+    DB write -- and partner tenants' rows are copied from Elephant Edge's only once, at
+    creation time (_shared_product_backend_url(), used by create_tenant() above), never kept
+    in sync afterward. So rotating the active Render account by hand (updating one row) left
+    every existing partner silently pointed at whichever backend was active when THEY were
+    created -- a real, compounding drift this route closes by updating every tenant row in
+    one call, not just Elephant Edge's.
+
+    Deliberately updates ALL tenants unconditionally: every tenant this platform serves
+    shares the same physical backend deployment today (see deployment.md's architecture
+    diagram) -- there is no real case for one tenant to be on a different backend than
+    another right now."""
+    tenants = db.query(Tenant).all()
+    for tenant in tenants:
+        tenant.backend_url = payload.backend_url
+    db.commit()
+    return {"updated": len(tenants), "backend_url": payload.backend_url}
+
+
 class UserCreate(BaseModel):
     email: str
     password: str
