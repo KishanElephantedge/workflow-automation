@@ -1,0 +1,38 @@
+# Pings every known Render deployment of the gateway + Elephant Edge backend, across all
+# three free-tier accounts this system rotates through (see elephantedge-abm/deployment.md's
+# incident log -- each account's free bandwidth cap gets hit every few weeks, so the ACTIVE
+# pair changes, but which pair is idle right now is exactly the one most likely to need
+# waking before it's next used). Pinging all six keeps every account warm regardless of
+# which one vercel.json currently points at, so switching between them never means an idle,
+# cold-started service on the other end -- this file does not need editing on every rotation.
+#
+# /api/health, not /docs -- found live (see deployment.md) that /docs's response was too
+# large for a similar external scheduler's size limit; health is small and exists on both
+# the gateway and the backend.
+name: Keep Render services warm
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        url:
+          # Account 1 (Kishan's workspace) -- suspended as of 2026-09-15 (hit its 5GB/month
+          # free bandwidth cap); Render resets this monthly, so this becomes live again.
+          - https://elephantedge-gateway.onrender.com/api/health
+          - https://elephantedge-main.onrender.com/api/health
+          # Account 2
+          - https://workflow-automation-48nk.onrender.com/api/health
+          - https://elephantedge-workflow-1.onrender.com/api/health
+          # Account 3 -- currently the active pair (vercel.json + tenants.backend_url)
+          - https://workflow-automation-1ujz.onrender.com/api/health
+          - https://elephantedge-workflow-1-7k9d.onrender.com/api/health
+    steps:
+      - name: Ping
+        run: curl -sS -m 25 "${{ matrix.url }}" || true
