@@ -75,6 +75,14 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     role = Column(String, nullable=False, default="internal")
     tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=True)
+    # A long, random, unguessable opaque token for passwordless entry -- 2026-10-12, explicit
+    # instruction: a partner (Paul Foreman) wanted dashboard access via a shareable link, no
+    # login. NOT a JWT itself -- redeemed once per visit at GET /auth/magic-login, which then
+    # issues a REAL session cookie through the exact same create_session_token() path a normal
+    # password login uses, so every downstream permission check (role="partner", tenant_id
+    # scoping in proxy()) is unchanged and already correct. Unique so a token can be looked up
+    # directly; nullable because only a user actually given a magic link has one.
+    magic_token = Column(String, nullable=True, unique=True)
 
 
 class UsageSession(Base):
@@ -203,3 +211,5 @@ def ensure_columns():
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR NOT NULL DEFAULT 'internal'"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS tenant_id INTEGER REFERENCES tenants(id)"))
         conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS enabled_features JSON"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS magic_token VARCHAR"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_magic_token ON users (magic_token) WHERE magic_token IS NOT NULL"))

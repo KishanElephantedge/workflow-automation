@@ -99,6 +99,52 @@ def logout(request: Request, response: Response):
     return {"logged_out": True}
 
 
+@app.get("/auth/magic-login")
+def magic_login(token: str, request: Request, db: Session = Depends(get_db)):
+    """Passwordless entry, 2026-10-12 -- explicit instruction (Paul Foreman wanted dashboard
+    access via a shareable link, no login, indefinite until revoked). The token is a long,
+    random, unguessable string (issued by the admin endpoint below) that identifies a real
+    User row -- this is NOT itself the session; it just redeems into one through the EXACT
+    same create_session_token() path /auth/login uses, so every downstream check (role,
+    tenant_id scoping in proxy()) is unchanged and already correct. The token never expires on
+    its own (indefinite, per explicit instruction) -- revoke it by regenerating via the admin
+    endpoint, same as changing a password would invalidate old credentials."""
+    user = db.query(User).filter(User.magic_token == token).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="This link is no longer valid.")
+    session_token = create_session_token(user)
+    frontend_base = settings.frontend_origin.split(",")[0].strip()
+    redirect_to = f"{frontend_base}/partner/accounts" if user.role == "partner" else frontend_base
+    response = RedirectResponse(url=redirect_to)
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=session_token,
+        httponly=True,
+        max_age=settings.jwt_expire_minutes * 60,
+        **_cookie_kwargs(request),
+    )
+    return response
+
+
+class MagicLinkOut(BaseModel):
+    url: str
+
+
+@app.post("/api/admin/users/{user_id}/magic-link", response_model=MagicLinkOut)
+def issue_magic_link(user_id: int, request: Request, _admin: User = Depends(require_internal),
+                     db: Session = Depends(get_db)):
+    """Generate (or regenerate, invalidating any previous link) a passwordless entry link for
+    one user. Admin-gated the same as every other user-management route -- a partner cannot
+    mint their own or anyone else's magic link."""
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    target.magic_token = secrets.token_urlsafe(32)
+    db.commit()
+    gateway_base = f"{request.url.scheme}://{request.url.netloc}"
+    return {"url": f"{gateway_base}/auth/magic-login?token={target.magic_token}"}
+
+
 @app.get("/auth/me")
 def me(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     return _user_payload(user, db)
