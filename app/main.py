@@ -135,14 +135,24 @@ def issue_magic_link(user_id: int, request: Request, _admin: User = Depends(requ
                      db: Session = Depends(get_db)):
     """Generate (or regenerate, invalidating any previous link) a passwordless entry link for
     one user. Admin-gated the same as every other user-management route -- a partner cannot
-    mint their own or anyone else's magic link."""
+    mint their own or anyone else's magic link.
+
+    REAL BUG, found live 2026-10-12 (Paul Foreman): the link used to point straight at this
+    gateway's own onrender.com domain, so a direct browser navigation set the session cookie
+    there -- a DIFFERENT origin from the frontend (app.elephantedge.ai), which only ever talks
+    to its own origin via the Vercel /gw rewrite (see client.js's own comment for why: that
+    rewrite is what makes the cookie first-party at all). The cookie landed somewhere the
+    frontend's own auth check never looks, so every real click bounced straight to the login
+    page. Routing the link itself through the SAME /gw path every other API call already uses
+    makes the Set-Cookie first-party for app.elephantedge.ai too -- confirmed live, this is the
+    whole fix, no frontend change needed."""
     target = db.get(User, user_id)
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
     target.magic_token = secrets.token_urlsafe(32)
     db.commit()
-    gateway_base = f"{request.url.scheme}://{request.url.netloc}"
-    return {"url": f"{gateway_base}/auth/magic-login?token={target.magic_token}"}
+    frontend_base = settings.frontend_origin.split(",")[0].strip()
+    return {"url": f"{frontend_base}/gw/auth/magic-login?token={target.magic_token}"}
 
 
 @app.get("/auth/me")
