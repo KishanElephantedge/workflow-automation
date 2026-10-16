@@ -959,8 +959,17 @@ async def proxy(tenant_slug: str, path: str, request: Request, user: User = Depe
             # own copy of the user/session/auth model. A backend route that ignores this
             # header (nothing required it to change) behaves exactly as it always has.
             headers={
-                **{k: v for k, v in request.headers.items() if k.lower() not in ("host", "cookie", "content-length", "accept-encoding", "x-tenant-id")},
+                **{k: v for k, v in request.headers.items() if k.lower() not in ("host", "cookie", "content-length", "accept-encoding", "x-tenant-id", "x-internal-user")},
                 "x-tenant-id": str(tenant.id),
+                # Same trust pattern as x-tenant-id above: set here, server-side, from the
+                # session the gateway itself just verified -- never forwarded from the
+                # incoming request, so a backend route gating on this can trust it the same
+                # way it trusts x-tenant-id. Lets a backend route exist that a partner's own
+                # login must never reach even when proxied against their own tenant (e.g. an
+                # internal-only admin view of their workspace), which x-tenant-id alone can't
+                # express since it's identical whether the caller is the partner or an admin
+                # viewing them.
+                "x-internal-user": "true" if user.role == "internal" else "false",
             },
             timeout=120,
         )
