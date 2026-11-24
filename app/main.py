@@ -73,7 +73,8 @@ def _user_payload(user: User, db: Session) -> dict:
         t = db.get(Tenant, user.tenant_id)
         if t:
             tenant = {"id": t.id, "name": t.name, "slug": t.slug, "enabledFeatures": t.enabled_features or []}
-    return {"id": user.id, "email": user.email, "name": user.name, "role": user.role, "tenant": tenant}
+    return {"id": user.id, "email": user.email, "name": user.name, "role": user.role, "tenant": tenant,
+            "brand": user.brand}
 
 
 @app.post("/auth/login")
@@ -323,11 +324,20 @@ def set_backend_url_for_all_tenants(payload: BackendUrlUpdate, user: User = Depe
     return {"updated": len(tenants), "backend_url": payload.backend_url}
 
 
+class UserBrand(BaseModel):
+    name: str
+    support_email: str | None = None
+
+
 class UserCreate(BaseModel):
     email: str
     password: str
     name: str | None = None
     tenant_id: int
+    # Set when this login should see a reskinned name instead of the real tenant's, e.g. a
+    # white-label partner attached straight to the elephant-edge tenant itself (same data,
+    # different displayed name) -- see User.brand's docstring in db.py.
+    brand: UserBrand | None = None
 
 
 @app.get("/api/admin/users")
@@ -341,6 +351,7 @@ def list_users(user: User = Depends(require_internal), db: Session = Depends(get
             "id": u.id, "email": u.email, "name": u.name, "role": u.role,
             "tenant": {"id": t.id, "name": t.name, "slug": t.slug} if t else None,
             "createdAt": u.created_at.isoformat() if u.created_at else None,
+            "brand": u.brand,
         })
     return out
 
@@ -368,12 +379,26 @@ def create_partner_user(payload: UserCreate, user: User = Depends(require_intern
         name=payload.name,
         role="partner",
         tenant_id=tenant.id,
+        brand=payload.brand.dict() if payload.brand else None,
     )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     return {"id": new_user.id, "email": new_user.email, "role": new_user.role,
-            "tenant": {"id": tenant.id, "name": tenant.name, "slug": tenant.slug}}
+            "tenant": {"id": tenant.id, "name": tenant.name, "slug": tenant.slug},
+            "brand": new_user.brand}
+
+
+@app.patch("/api/admin/users/{user_id}/brand")
+def update_user_brand(user_id: int, payload: UserBrand | None, _admin: User = Depends(require_internal), db: Session = Depends(get_db)):
+    """Edit or clear (payload=null) a login's white-label override after creation, without
+    recreating the user. Admin-gated like every other user-management route."""
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    target.brand = payload.dict() if payload else None
+    db.commit()
+    return {"id": target.id, "brand": target.brand}
 
 
 # ---- Usage analytics ----

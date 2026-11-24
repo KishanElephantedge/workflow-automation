@@ -83,6 +83,11 @@ class User(Base):
     # scoping in proxy()) is unchanged and already correct. Unique so a token can be looked up
     # directly; nullable because only a user actually given a magic link has one.
     magic_token = Column(String, nullable=True, unique=True)
+    # White-label override for THIS login only -- never touches Tenant.name, since the same
+    # tenant (e.g. "elephant-edge") is also used by real internal logins who must keep seeing
+    # the real brand. {"name": ..., "supportEmail": ...}, both optional. Null means "show the
+    # real brand", which is every user until explicitly set.
+    brand = Column(JSON, nullable=True)
 
 
 class UsageSession(Base):
@@ -213,3 +218,4 @@ def ensure_columns():
         conn.execute(text("ALTER TABLE tenants ADD COLUMN IF NOT EXISTS enabled_features JSON"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS magic_token VARCHAR"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_magic_token ON users (magic_token) WHERE magic_token IS NOT NULL"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS brand JSON"))
